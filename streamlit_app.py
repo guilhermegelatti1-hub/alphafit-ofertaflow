@@ -4,6 +4,7 @@ Deliberately session-only: Community Cloud has no durable local storage.
 Do not persist OAuth tokens or real credentials into GitHub.
 """
 import hashlib
+import re
 import hmac
 import secrets as pysecrets
 import time
@@ -13,7 +14,8 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 import streamlit as st
 
-from ofertas_core import affiliate_format, clean_price, dump_csv, item_id, load_csv, message, whatsapp_url
+from ofertas_core import affiliate_format, clean_price, dump_csv, item_id, load_csv, message, whatsapp_url, money
+from market_search import filter_listings, search_params, marketplace_search_url, catalog_winner_listing, SORT_OPTIONS
 
 st.set_page_config(page_title='AlphaFit | OfertaFlow', page_icon='🏷️', layout='wide')
 st.markdown('''<style>
@@ -135,6 +137,12 @@ def save_product(product):
 
 if 'products' not in st.session_state:st.session_state['products']={}
 if 'authenticated' not in st.session_state:st.session_state['authenticated']=False
+if 'market_raw' not in st.session_state:st.session_state['market_raw']=[]
+if 'market_request' not in st.session_state:st.session_state['market_request']=None
+if 'market_error' not in st.session_state:st.session_state['market_error']=''
+if 'market_updated' not in st.session_state:st.session_state['market_updated']=0
+if 'market_source' not in st.session_state:st.session_state['market_source']='anuncios'
+if 'market_auto' not in st.session_state:st.session_state['market_auto']=False
 
 # Security guard: no publicly usable dashboard without configured secrets.
 if not secrets_complete():
@@ -198,7 +206,169 @@ c1.metric('Produtos cadastrados',len(products))
 c2.metric('Com link cadastrado',ready)
 c3.metric('Aguardando link',len(products)-ready)
 
-tab_offers,tab_add,tab_import,tab_meli=st.tabs(['Ofertas','Adicionar produto','CSV / Backup','Conta Mercado Livre'])
+def search_marketplace():
+    """Busca anúncios via API; erro real não vira resultado inventado."""
+    request = st.session_state.get('market_request')
+    if not request:
+        return
+    try:
+        params = search_params(request['query'], request['category'], request['seller_id'])
+        response = api_request('GET','/sites/MLB/search',params=params,token=access_token())
+        if not isinstance(response,dict) or not isinstance(response.get('results'),list):
+            raise RuntimeError('A API de busca retornou dados inesperados.')
+        st.session_state['market_raw'] = response['results']
+        st.session_state['market_source'] = 'anuncios'
+        st.session_state['market_error'] = ''
+    except (RuntimeError,ValueError) as exc:
+        msg = str(exc)
+        if 'HTTP 403' in msg:
+            if not request['category'] and not request['seller_id']:
+                try:
+                    catalog = api_request('GET','/products/search',params={
+                        'q':request['query'],'status':'active','site_id':'MLB','limit':8},
+                        token=access_token())
+                    if not isinstance(catalog,dict) or not isinstance(catalog.get('results'),list):
+                        raise RuntimeError('Catálogo retornou dados inesperados.')
+                    entries=[]
+                    for product in catalog['results'][:8]:
+                        code=product.get('id') if isinstance(product,dict) else None
+                        if not isinstance(code,str) or not re.fullmatch(r'MLB\d{6,15}',code):
+                            continue
+                        try:
+                            detail=api_request('GET','/products/'+code,token=access_token())
+                            listing=catalog_winner_listing(detail)
+                            if listing:
+                                entries.append(listing)
+                        except RuntimeError:
+                            continue
+                    st.session_state['market_raw']=entries
+                    st.session_state['market_source']='catalogo'
+                    st.session_state['market_error']=''
+                    st.session_state['market_updated']=time.time()
+                    return
+                except RuntimeError:
+                    pass
+            msg=('O Mercado Livre bloqueou a busca geral de anúncios (HTTP 403). '
+                 'Para tentar a busca alternativa no catálogo, retire categoria e vendedor. '
+                 'O catálogo também pode estar indisponível para esta conta.')
+        if 'HTTP 429' in msg:
+            msg='Limite de consultas da API (HTTP 429). Aguarde antes de pesquisar novamente.'
+        st.session_state['market_raw']=[]
+        st.session_state['market_error']=msg
+    st.session_state['market_updated']=time.time()
+
+
+tab_market,tab_offers,tab_add,tab_import,tab_meli=st.tabs(
+    ['Buscar produtos','Minhas ofertas','Adicionar produto','CSV / Backup','Conta Mercado Livre'])
+
+with tab_market:
+    st.markdown('#### Buscar produtos no Mercado Livre Brasil')
+    st.caption('Busca pela API oficial; preço, frete e desconto são filtrados nos primeiros 50 anúncios retornados.')
+    connected=bool(st.session_state.get('meli_tokens'))
+    if not connected:
+        st.info('Conecte o Mercado Livre na aba Conta Mercado Livre para usar a pesquisa.')
+    if connected and 'market_categories' not in st.session_state:
+        try:
+            raw_categories=api_request('GET','/sites/MLB/categories',token=access_token())
+            if not isinstance(raw_categories,list):
+                raise RuntimeError('Categorias indisponíveis.')
+            st.session_state['market_categories']={c['name']:c['id'] for c in raw_categories
+                if isinstance(c,dict) and isinstance(c.get('name'),str)
+                and isinstance(c.get('id'),str)}
+        except (RuntimeError,ValueError):
+            st.session_state['market_categories']={}
+    options={'Todas as categorias':''}
+    options.update(st.session_state.get('market_categories',{}))
+    with st.form('market_search_form'):
+        phrase=st.text_input('Produto ou palavra-chave',placeholder='creatina 300g, tênis corrida, halteres...')
+        left,right=st.columns(2)
+        with left:
+            chosen=st.selectbox('Categoria',list(options))
+            min_price=st.number_input('Preço mínimo (R$)',min_value=0.0,max_value=1000000.0,step=10.0)
+            condition=st.selectbox('Condição',['Todos','Novos','Usados'])
+            freight=st.checkbox('Apenas frete grátis')
+        with right:
+            seller=st.text_input('ID do vendedor (opcional)',placeholder='Apenas números')
+            max_price=st.number_input('Preço máximo (R$; 0 = sem limite)',min_value=0.0,max_value=1000000.0,step=10.0)
+            min_discount=st.slider('Desconto mínimo informado (%)',0,80,0,5)
+            order=st.selectbox('Ordenar por',SORT_OPTIONS)
+        submitted=st.form_submit_button('Buscar produtos automaticamente',use_container_width=True,disabled=not connected)
+    if submitted:
+        if max_price and max_price < min_price:
+            st.error('O preço máximo não pode ser inferior ao mínimo.')
+        else:
+            req={'query':phrase.strip(),'category':options[chosen],'seller_id':seller.strip(),
+                 'min_price':min_price,'max_price':max_price,'min_discount':min_discount,
+                 'free_shipping':freight,'condition':condition,'order':order}
+            try:
+                search_params(req['query'],req['category'],req['seller_id'])
+                st.session_state['market_request']=req
+                search_marketplace()
+            except ValueError as exc:
+                st.error(str(exc))
+    st.checkbox('Atualizar automaticamente a cada 15 minutos enquanto o site estiver aberto',key='market_auto')
+
+    @st.fragment(run_every='15m')
+    def market_results():
+        req=st.session_state.get('market_request')
+        if not req:
+            return
+        if (st.session_state.get('market_auto') and
+                time.time()-st.session_state.get('market_updated',0)>=900):
+            search_marketplace()
+        if st.session_state.get('market_error'):
+            st.error(st.session_state['market_error'])
+            st.link_button('Abrir pesquisa no site do Mercado Livre',marketplace_search_url(req['query']))
+            return
+        try:
+            found=filter_listings(st.session_state.get('market_raw',[]),
+                min_price=req['min_price'],max_price=req['max_price'],
+                min_discount=req['min_discount'],free_shipping=req['free_shipping'],
+                condition=req['condition'],order=req['order'])
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        source=st.session_state.get('market_source','anuncios')
+        if source=='catalogo':
+            st.warning('Busca geral bloqueada: estes são apenas produtos do catálogo com oferta vencedora real. '
+                       'O catálogo não informa desconto anterior e não cobre todos os anúncios.')
+        st.caption(f'{len(found)} produto(s) após filtros; '
+                   f'{len(st.session_state.get("market_raw",[]))} anúncio(s) recebidos '
+                   f'via {"catálogo" if source=="catalogo" else "busca geral"}.')
+        if st.session_state.get('market_updated'):
+            st.caption('Última consulta: '+time.strftime('%d/%m/%Y %H:%M',time.localtime(st.session_state['market_updated'])))
+        if not found:
+            st.info('Nenhum resultado corresponde aos filtros nesta consulta.')
+        for product in found:
+            key=product['item_id']
+            with st.container(border=True):
+                image_col,detail_col=st.columns([1,4])
+                with image_col:
+                    if product['image_url']:
+                        st.image(product['image_url'],width=125)
+                with detail_col:
+                    st.markdown('**'+product['title']+'**')
+                    st.write(money(product['price']))
+                    extras=[]
+                    if product['discount']:
+                        extras.append(f"{product['discount']}% OFF informado")
+                    if product['free_shipping']:
+                        extras.append('Frete grátis')
+                    if extras:
+                        st.caption(' • '.join(extras))
+                    st.caption('Anúncio: '+key)
+                    if product['permalink']:
+                        st.link_button('Ver anúncio',product['permalink'])
+                    if key in st.session_state['products']:
+                        st.caption('Já adicionado às suas ofertas.')
+                    elif st.button('Adicionar às minhas ofertas',key='market-add-'+key):
+                        save_product(product)
+                        st.success('Adicionado. Agora cadastre seu link de afiliado em Minhas ofertas.')
+        st.info('A busca não gera links de afiliado. A divulgação só será liberada '
+                'quando você cadastrar seu link gerado no Portal de Afiliados.')
+    market_results()
+
+
 
 with tab_offers:
     if not products:st.info('Nenhum produto cadastrado. Adicione um anúncio ou importe um CSV.')
