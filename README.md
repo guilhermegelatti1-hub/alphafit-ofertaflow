@@ -4,7 +4,7 @@
 
 ## 1. Publicar
 
-1. Mantenha este repositório **privado** (`guilhermegelatti1-hub/alphafit-ofertaflow`).
+1. O repositório pode ser público para implantação, mas não faça commits de senhas, tokens, `.env` ou `.streamlit/secrets.toml`.
 2. Em https://share.streamlit.io/deploy, conecte o GitHub e escolha:
    - **Repository:** `guilhermegelatti1-hub/alphafit-ofertaflow`
    - **Branch:** `main`
@@ -38,7 +38,17 @@ Permissões necessárias: fluxo Authorization Code, Refresh Token, negócio Merc
 
 A conexão OAuth permite consultar informações da conta pela API, dependendo dos escopos e permissões efetivamente disponíveis. **Ela não gera links de afiliado.**
 
-## 3. Uso
+## 3. Busca e filtros automáticos
+
+A aba **Buscar produtos** usa a API oficial do Mercado Livre Brasil para buscar anúncios por palavras-chave, após autorização da conta. Filtros básicos: **categoria, ID do vendedor, preço mínimo/máximo, condição (novo/usado), frete grátis, desconto mínimo informado e ordenação**. A busca usa até 50 anúncios por consulta e filtra somente essa amostra; ela não representa necessariamente todo o mercado.
+
+Quando a busca geral é bloqueada pela API com **HTTP 403**, o aplicativo tenta uma consulta limitada ao catálogo oficial de produtos (sem filtro de vendedor/categoria) e aceita apenas ofertas vencedoras com anúncio e preço identificados; produtos de catálogo sem oferta real são descartados. Preços anteriores e descontos não são inferidos. Caso também não seja possível, o aplicativo explica o erro e abre a pesquisa no próprio Mercado Livre. A documentação oficial contempla os endpoints de busca e catálogo, mas algumas contas podem receber HTTP 403.
+
+A opção **Atualizar a cada 15 minutos** funciona **somente com a sessão aberta no navegador**; não é monitoramento contínuo em segundo plano.
+
+**Proteção do afiliado:** o produto pesquisado é salvo sem link de afiliado. Uma publicação de WhatsApp somente pode ser gerada depois que você informar um link válido produzido na sua conta. Links existentes são preservados ao buscar novamente.
+
+## 4. Uso
 
 - Adicione produtos manualmente pelo ID do anúncio `MLB...` ou URL oficial; com OAuth ativo, o programa tenta consultar dados do anúncio pela API.
 - Cole **seu próprio link de afiliado**, gerado no portal oficial do Mercado Livre, e confirme sua origem.
@@ -46,14 +56,14 @@ A conexão OAuth permite consultar informações da conta pela API, dependendo d
 - Importe ou **exporte CSV após cada mudança**; o Streamlit Community Cloud não garante persistência do armazenamento local nem da sessão.
 - Um link com formato válido **não prova** a titularidade, comissão ou atribuição. Confira no Portal do Afiliado.
 
-## 4. Limitações desta primeira versão Streamlit
+## 5. Limitações desta primeira versão Streamlit
 
 - Produtos e tokens OAuth ficam **apenas na sessão ativa**. Depois de um reinício, logout ou perda de sessão, será necessário importar o CSV novamente e autorizar o Mercado Livre novamente. A versão **não é adequada para dados que precisam de retenção automática** sem adicionar armazenamento externo.
 - A conta protegida é de **uso pessoal**; configure a aplicação Streamlit como **privada**, além da senha forte do painel.
 - Comissões e clique/venda não são auditados automaticamente; o programa não tem integração pública ao gerador de links de afiliado do Mercado Livre.
 - O app utiliza autenticação OAuth com `state` assinado e expirável. Para uma futura versão multiusuário, seria necessário adicionar armazenamento persistente e vinculação de estados OAuth a sessões individuais com controles adicionais.
 
-## 5. Testes locais
+## 6. Testes locais
 
 ```bash
 python -m pip install -r requirements.txt pytest
